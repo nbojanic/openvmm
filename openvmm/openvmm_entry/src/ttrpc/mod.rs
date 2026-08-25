@@ -57,6 +57,7 @@ use netvsp_resources::NetvspHandle;
 use openvmm_defs::config::Config;
 use openvmm_defs::config::DeviceVtl;
 use openvmm_defs::config::HypervisorConfig;
+use openvmm_defs::config::IsolationType;
 use openvmm_defs::config::LoadMode;
 use openvmm_defs::config::MemoryConfig;
 use openvmm_defs::config::NumaDistance;
@@ -74,6 +75,7 @@ use openvmm_defs::config::VirtioBus;
 use openvmm_defs::config::VmbusConfig;
 use openvmm_defs::config::VpAssignment;
 use openvmm_defs::config::VpciDeviceConfig;
+use openvmm_defs::config::Vtl2BaseAddressType;
 use openvmm_defs::rpc::VmRpc;
 use openvmm_defs::worker::VM_WORKER;
 use openvmm_defs::worker::VmWorkerParameters;
@@ -87,6 +89,7 @@ use pal_async::task::Task;
 use scsidisk_resources::SimpleScsiDiskHandle;
 use std::fs::File;
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use storvsp_resources::ScsiControllerHandle;
@@ -718,14 +721,27 @@ impl VmService {
         #[cfg(guest_arch = "x86_64")]
         let arch = vm_manifest_builder::MachineArch::X86_64;
 
+        let isolation = match req_config
+            .isolation_config
+            .take()
+            .unwrap_or_default()
+            .isolation_type()
+        {
+            vmservice::isolation_config::Type::None => None,
+            vmservice::isolation_config::Type::Snp => Some(IsolationType::Snp),
+        };
+
         // The boot configuration also determines the base chipset, since the
         // firmware and the device model have to agree on the platform.
-        let (load_mode, base_chipset_type, uefi_config) = match req_config
+        let (load_mode, base_chipset_type, uefi_config, igvm_path) = match req_config
             .boot_config
             .take()
             .context("missing boot configuration")?
         {
             vmservice::vm_config::BootConfig::DirectBoot(boot) => {
+                if isolation.is_some() {
+                    bail!("SNP isolation through VM service requires IGVM boot");
+                }
                 let kernel = File::open(boot.kernel_path).context("failed to open kernel")?;
                 let initrd = if boot.initrd_path.is_empty() {
                     None
@@ -743,9 +759,32 @@ impl VmService {
                     },
                     vm_manifest_builder::BaseChipsetType::HyperVGen2LinuxDirect,
                     None,
+                    None,
+                )
+            }
+            vmservice::vm_config::BootConfig::Igvm(boot) => {
+                if isolation != Some(IsolationType::Snp) {
+                    bail!("IGVM boot through VM service requires SNP isolation");
+                }
+                let igvm_path = PathBuf::from(&boot.igvm_path);
+                let file = File::open(&igvm_path)
+                    .with_context(|| format!("failed to open IGVM {}", igvm_path.display()))?;
+                (
+                    LoadMode::Igvm {
+                        file: file.into(),
+                        cmdline: String::new(),
+                        vtl2_base_address: Vtl2BaseAddressType::File,
+                        com_serial: None,
+                    },
+                    vm_manifest_builder::BaseChipsetType::EnlightenedLinuxDirect,
+                    None,
+                    Some(igvm_path),
                 )
             }
             vmservice::vm_config::BootConfig::Uefi(uefi) => {
+                if isolation.is_some() {
+                    bail!("SNP isolation through VM service requires IGVM boot");
+                }
                 let firmware = File::open(&uefi.firmware_path).with_context(|| {
                     format!("failed to open uefi firmware {}", uefi.firmware_path)
                 })?;
@@ -810,6 +849,7 @@ impl VmService {
                     },
                     vm_manifest_builder::BaseChipsetType::HypervGen2Uefi,
                     Some((base_template_json, uefi.secure_boot_enabled)),
+                    None,
                 )
             }
         };
@@ -892,7 +932,7 @@ impl VmService {
             ide_disks: vec![],
             floppy_disks: vec![],
             pcie_root_complexes: pcie.root_complexes,
-            pcie_ecam_below_4gb: false,
+            pcie_ecam_below_4gb: isolation == Some(IsolationType::Snp),
             pcie_devices: pcie.devices,
             pcie_switches: pcie.switches,
             pcie_generic_initiators: pcie.generic_initiators,
@@ -907,6 +947,7 @@ impl VmService {
             },
             hypervisor: HypervisorConfig {
                 with_hv: true,
+                with_isolation: isolation,
                 ..Default::default()
             },
             #[cfg(windows)]
@@ -916,7 +957,11 @@ impl VmService {
             vga_firmware: None,
             vtl2_gfx: false,
             virtio_devices: vec![],
-            vmbus: Some(VmbusConfig::default()),
+            vmbus: if isolation == Some(IsolationType::Snp) {
+                None
+            } else {
+                Some(VmbusConfig::default())
+            },
             vtl2_vmbus: None,
             vmbus_devices: vec![],
             #[cfg(windows)]
@@ -1096,7 +1141,7 @@ impl VmService {
             ged_rpc: None,
             vm_rpc: send.clone(),
             paravisor_diag: None,
-            igvm_path: None,
+            igvm_path,
             memory_backing_file: None,
             memory,
             processors,
