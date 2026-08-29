@@ -195,10 +195,12 @@ fn selected_platform_header(
     }
 }
 
-/// Extract backend-owned isolation configuration from an IGVM file.
+/// Build backend-owned isolation configuration from an IGVM file and host
+/// launch parameters.
 pub fn isolation_config(
     igvm_file: &IgvmFile,
     igvm_isolation_type: igvm::IsolationType,
+    snp_host_data: Option<[u8; 32]>,
 ) -> Result<Option<virt::IgvmIsolationConfig>, Error> {
     if igvm_isolation_type != igvm::IsolationType::Snp {
         return Ok(None);
@@ -331,6 +333,7 @@ pub fn isolation_config(
             vp_contexts,
             expected_vp_apic_ids,
             identity,
+            host_data: snp_host_data,
         },
     ))))
 }

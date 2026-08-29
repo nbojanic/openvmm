@@ -155,6 +155,7 @@ pub enum LoadMode {
         cmdline: String,
         vtl2_base_address: Vtl2BaseAddressType,
         com_serial: Option<SerialInformation>,
+        snp_host_data: Option<[u8; 32]>,
     },
     None,
 }

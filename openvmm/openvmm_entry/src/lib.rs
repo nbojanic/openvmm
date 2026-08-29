@@ -1294,6 +1294,7 @@ async fn vm_config_from_command_line(
                 io_port: ComPort::Com3.io_port(),
                 irq: ComPort::Com3.irq().into(),
             }),
+            snp_host_data: None,
         };
     } else if opt.pcat {
         // Emit a nice error early instead of complaining about missing firmware.

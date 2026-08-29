@@ -931,6 +931,10 @@ impl InitializedVm {
             .with_isolation
             .map(Into::into)
             .unwrap_or(virt::IsolationType::None);
+        let snp_host_data = match &cfg.load_mode {
+            LoadMode::Igvm { snp_host_data, .. } => *snp_host_data,
+            _ => None,
+        };
         // Pre-parse the IGVM file early so the backend can consume opaque
         // isolation metadata before it creates memory regions or VPs.
         let igvm_file = if let LoadMode::Igvm { file, .. } = &cfg.load_mode {
@@ -949,6 +953,7 @@ impl InitializedVm {
                 super::vm_loaders::igvm::isolation_config(
                     file,
                     super::vm_loaders::igvm::igvm_isolation_type(partition_isolation),
+                    snp_host_data,
                 )
             })
             .transpose()
@@ -3278,6 +3283,7 @@ impl LoadedVmInner {
                 ref cmdline,
                 vtl2_base_address,
                 com_serial,
+                ..
             } => {
                 let madt = acpi_builder.build_madt();
                 let srat = acpi_builder.build_srat();

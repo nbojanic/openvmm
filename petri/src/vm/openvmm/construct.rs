@@ -1124,6 +1124,7 @@ impl PetriVmConfigSetupCore<'_> {
                         io_port: ComPort::Com3.io_port(),
                         irq: ComPort::Com3.irq().into(),
                     }),
+                    snp_host_data: None,
                 }
             }
             (a, f) => anyhow::bail!("Unsupported firmware {f:?} for arch {a:?}"),

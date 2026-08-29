@@ -277,7 +277,10 @@ pub struct SnpIdentity {
     pub author_public_key: SnpIdBlockPublicKey,
 }
 
-/// Backend-neutral SNP launch configuration extracted from an IGVM file.
+/// Backend-neutral effective SNP launch configuration.
+///
+/// Combines isolation metadata extracted from an IGVM file with host-provided
+/// launch parameters.
 #[derive(Eq, PartialEq, Debug, Clone)]
 pub struct SnpConfig {
     /// The SNP guest policy.
@@ -294,9 +297,11 @@ pub struct SnpConfig {
     pub expected_vp_apic_ids: Option<Vec<u32>>,
     /// Optional launch identity and authentication data.
     pub identity: Option<SnpIdentity>,
+    /// Optional host-provided data included in SNP launch finish.
+    pub host_data: Option<[u8; 32]>,
 }
 
-/// Isolation configuration extracted from a filtered IGVM file.
+/// Effective isolation configuration for a filtered IGVM file.
 #[derive(Eq, PartialEq, Debug, Clone)]
 pub enum IgvmIsolationConfig {
     /// AMD SEV-SNP launch configuration.
@@ -307,7 +312,7 @@ pub enum IgvmIsolationConfig {
 pub struct ProtoPartitionConfig<'a> {
     /// The set of VPs to create.
     pub processor_topology: &'a ProcessorTopology,
-    /// Isolation configuration extracted from the selected IGVM platform.
+    /// Effective isolation configuration for the selected IGVM platform.
     ///
     /// Backends that require isolation properties before prototype creation
     /// may inspect this value early. The orchestrator still calls

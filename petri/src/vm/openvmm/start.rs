@@ -255,6 +255,7 @@ impl PetriVmConfigOpenVmm {
                 cmdline: String::new(),
                 vtl2_base_address: Vtl2BaseAddressType::File,
                 com_serial: None,
+                snp_host_data: None,
             };
             Ok(())
         }

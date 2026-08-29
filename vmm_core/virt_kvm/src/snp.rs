@@ -292,6 +292,11 @@ impl KvmPartitionInner {
         }
         self.prepare_snp_vmsa_register_state()?;
         tracing::debug!("KVM_SEV_SNP_LAUNCH_FINISH");
+        let host_data = self
+            .snp_config
+            .as_ref()
+            .and_then(|config| config.generic.host_data)
+            .unwrap_or_default();
         if let Some(identity) = self
             .snp_config
             .as_ref()
@@ -305,13 +310,16 @@ impl KvmPartitionInner {
                 id_block_en: 1,
                 auth_key_en: (identity.author_key_enabled != 0).into(),
                 vcek_disabled: 0,
-                host_data: [0; 32],
+                host_data,
                 ..Default::default()
             };
             self.kvm.sev_snp_launch_finish(sev.as_fd(), &mut finish)?;
         } else {
-            self.kvm
-                .sev_snp_launch_finish(sev.as_fd(), &mut Default::default())?;
+            let mut finish = kvm::kvm_sev_snp_launch_finish {
+                host_data,
+                ..Default::default()
+            };
+            self.kvm.sev_snp_launch_finish(sev.as_fd(), &mut finish)?;
         }
         Ok(())
     }
@@ -749,6 +757,7 @@ mod tests {
             vp_contexts,
             expected_vp_apic_ids: None,
             identity: None,
+            host_data: None,
         })
     }
 

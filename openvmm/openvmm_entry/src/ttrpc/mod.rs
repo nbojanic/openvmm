@@ -721,16 +721,22 @@ impl VmService {
         #[cfg(guest_arch = "x86_64")]
         let arch = vm_manifest_builder::MachineArch::X86_64;
 
-        let isolation = match req_config
-            .isolation_config
-            .take()
-            .unwrap_or_default()
-            .isolation_type()
-        {
+        let isolation_config = req_config.isolation_config.take().unwrap_or_default();
+        let isolation = match isolation_config.isolation_type() {
             vmservice::isolation_config::Type::None => None,
             vmservice::isolation_config::Type::Snp => Some(IsolationType::Snp),
         };
-
+        let snp_host_data = if isolation_config.host_data.is_empty() {
+            None
+        } else {
+            Some(
+                isolation_config
+                    .host_data
+                    .as_slice()
+                    .try_into()
+                    .context("SNP host data must be exactly 32 bytes")?,
+            )
+        };
         // The boot configuration also determines the base chipset, since the
         // firmware and the device model have to agree on the platform.
         let (load_mode, base_chipset_type, uefi_config, igvm_path) = match req_config
@@ -775,6 +781,7 @@ impl VmService {
                         cmdline: String::new(),
                         vtl2_base_address: Vtl2BaseAddressType::File,
                         com_serial: None,
+                        snp_host_data,
                     },
                     vm_manifest_builder::BaseChipsetType::EnlightenedLinuxDirect,
                     None,

@@ -349,6 +349,12 @@ pub(super) fn set_ghcb_error(ghcb: &mut x86defs::snp::GhcbPage, error: u64) {
     ghcb.save.valid_bitmap1 |= GHCB_SW_EXIT_INFO1_VALID_BIT | GHCB_SW_EXIT_INFO2_VALID_BIT;
 }
 
+fn set_snp_guest_request_result(ghcb: &mut x86defs::snp::GhcbPage, result: u64) {
+    ghcb.save.sw_exit_info1 = 0;
+    ghcb.save.sw_exit_info2 = result;
+    ghcb.save.valid_bitmap1 |= GHCB_SW_EXIT_INFO1_VALID_BIT | GHCB_SW_EXIT_INFO2_VALID_BIT;
+}
+
 pub(super) fn parse_snp_ap_create_request(
     ghcb: &x86defs::snp::GhcbPage,
 ) -> Result<SnpApCreateRequest, SnpApCreateRequestError> {
@@ -883,6 +889,32 @@ impl MshvPartitionInner {
     }
 }
 
+fn snp_guest_request_gpas(
+    mem_layout: &vm_topology::memory::MemoryLayout,
+    request_gpa: u64,
+    response_gpa: u64,
+) -> Option<mshv_bindings::mshv_issue_psp_guest_request> {
+    let page_is_valid = |gpa: u64| {
+        let end = gpa.checked_add(hvdef::HV_PAGE_SIZE)?;
+        if !gpa.is_multiple_of(hvdef::HV_PAGE_SIZE)
+            || !mem_layout
+                .ram()
+                .iter()
+                .any(|range| range.range.contains(&MemoryRange::new(gpa..end)))
+        {
+            return None;
+        }
+        Some(())
+    };
+
+    page_is_valid(request_gpa)?;
+    page_is_valid(response_gpa)?;
+    Some(mshv_bindings::mshv_issue_psp_guest_request {
+        req_gpa: request_gpa,
+        rsp_gpa: response_gpa,
+    })
+}
+
 fn snp_launch_finish_data(
     config: Option<&MshvSnpConfig>,
 ) -> (mshv_bindings::hv_psp_launch_finish_data, u64) {
@@ -896,6 +928,9 @@ fn snp_launch_finish_data(
         |config| config.generic.policy,
     );
     parameters.id_block.policy = mshv_bindings::hv_snp_guest_policy { as_uint64: policy };
+    parameters.host_data = config
+        .and_then(|config| config.generic.host_data)
+        .unwrap_or_default();
 
     if let Some(identity) = config.and_then(|config| config.generic.identity.as_ref()) {
         let id_block = virt::x86::snp::snp_id_block(identity, policy);
@@ -1551,6 +1586,31 @@ impl MshvProcessor<'_> {
             exit_code if exit_code == u64::from(SVM_EXITCODE_SNP_AP_CREATION) => {
                 self.handle_snp_ap_create(info, ghcb_gpa)?;
             }
+            exit_code if exit_code == u64::from(SVM_EXITCODE_SNP_GUEST_REQUEST) => {
+                let request = snp_guest_request_gpas(
+                    &self.partition.mem_layout,
+                    info.ghcb_page.standard.sw_exit_info1,
+                    info.ghcb_page.standard.sw_exit_info2,
+                )
+                .ok_or(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 })?;
+
+                self.partition
+                    .vmfd
+                    .psp_issue_guest_request(&request)
+                    .map_err(|err| {
+                        tracing::error!(
+                            error = &err as &dyn std::error::Error,
+                            "MSHV SNP guest request failed"
+                        );
+                        VpHaltReason::TripleFault { vtl: Vtl::Vtl0 }
+                    })?;
+
+                let ghcb = self
+                    .runner
+                    .ghcb_page()
+                    .ok_or(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 })?;
+                set_snp_guest_request_result(ghcb, 0);
+            }
             exit_code => {
                 tracelimit::warn_ratelimited!(
                     exit_code,
@@ -1717,6 +1777,7 @@ mod tests {
             })],
             expected_vp_apic_ids: None,
             identity: None,
+            host_data: None,
         });
         (topology, config)
     }
@@ -1838,6 +1899,7 @@ mod tests {
     fn builds_snp_launch_finish_identity() {
         let (topology, mut config) = test_snp_config(1, 0xffff_ffff_f000, false);
         Arc::make_mut(&mut config).identity = Some(test_identity());
+        Arc::make_mut(&mut config).host_data = Some([0xaa; 32]);
         let prepared = prepare_snp_config(config, &topology, 48).unwrap();
         let (parameters, policy) = snp_launch_finish_data(Some(&prepared));
         let id_block = parameters.id_block;
@@ -1857,6 +1919,7 @@ mod tests {
         assert_eq!(guest_svn, 7);
         assert_eq!(parameters.id_block_enabled, 1);
         assert_eq!(parameters.author_key_enabled, 1);
+        assert_eq!(parameters.host_data, [0xaa; 32]);
         assert_eq!(id_key_algorithm, 1);
         assert_eq!(auth_key_algorithm, 2);
         assert_eq!(&id_auth.id_block_signature[..72], &[0x44; 72]);
@@ -1865,6 +1928,30 @@ mod tests {
         assert_eq!(&id_auth.id_key[4..76], &[0x66; 72]);
         assert_eq!(&id_auth.id_key_signature[..72], &[0x88; 72]);
         assert_eq!(&id_auth.author_key[..4], &3u32.to_le_bytes());
+    }
+
+    #[test]
+    fn validates_snp_guest_request_gpas() {
+        let layout =
+            vm_topology::memory::MemoryLayout::new(0x8000000, &[], &[], &[], None).unwrap();
+
+        let request = snp_guest_request_gpas(&layout, 0x400000, 0x401000).unwrap();
+        assert_eq!(request.req_gpa, 0x400000);
+        assert_eq!(request.rsp_gpa, 0x401000);
+        assert!(snp_guest_request_gpas(&layout, 0x400001, 0x401000).is_none());
+        assert!(snp_guest_request_gpas(&layout, 0x8000000, 0x401000).is_none());
+    }
+
+    #[test]
+    fn marks_snp_guest_request_result_valid() {
+        let mut ghcb = x86defs::snp::GhcbPage::new_zeroed();
+        ghcb.save.sw_exit_info1 = 0x400000;
+        ghcb.save.valid_bitmap1 |= GHCB_SW_EXIT_CODE_VALID_BIT;
+        set_snp_guest_request_result(&mut ghcb, 0);
+        assert_eq!(ghcb.save.sw_exit_info1, 0);
+        assert_eq!(ghcb.save.sw_exit_info2, 0);
+        assert!(ghcb_exit_fields_are_valid(&ghcb));
+        assert!(ghcb_exit_info2_is_valid(&ghcb));
     }
 
     #[test]
