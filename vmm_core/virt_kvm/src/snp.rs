@@ -749,6 +749,7 @@ mod tests {
             vp_contexts,
             expected_vp_apic_ids: None,
             identity: None,
+            host_data: None,
         })
     }
 

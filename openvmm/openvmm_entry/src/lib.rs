@@ -2034,6 +2034,7 @@ async fn vm_config_from_command_line(
                 },
             }),
             with_isolation,
+            snp_host_data: None,
             snp_disable_cpuid_offload: opt.snp_disable_cpuid_offload,
             nested_virt: opt.nested_virt,
         },

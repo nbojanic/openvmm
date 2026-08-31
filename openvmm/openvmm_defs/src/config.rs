@@ -511,6 +511,8 @@ pub struct HypervisorConfig {
     pub with_hv: bool,
     pub with_vtl2: Option<Vtl2Config>,
     pub with_isolation: Option<IsolationType>,
+    /// Optional host-provided data included in SNP launch finish.
+    pub snp_host_data: Option<[u8; 32]>,
     /// Disable MSHV handling of SNP GHCB CPUID requests.
     pub snp_disable_cpuid_offload: bool,
     /// Expose hardware virtualization (VMX/SVM) to the guest so that it can run

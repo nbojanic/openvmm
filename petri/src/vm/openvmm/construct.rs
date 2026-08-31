@@ -688,6 +688,7 @@ impl PetriVmConfigOpenVmm {
                     None => None,
                     Some(IsolationType::Tdx) => anyhow::bail!("unsupported isolation type"),
                 },
+                snp_host_data: None,
                 snp_disable_cpuid_offload: false,
                 nested_virt: false,
             },

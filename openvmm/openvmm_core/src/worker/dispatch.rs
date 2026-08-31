@@ -949,6 +949,7 @@ impl InitializedVm {
                 super::vm_loaders::igvm::isolation_config(
                     file,
                     super::vm_loaders::igvm::igvm_isolation_type(partition_isolation),
+                    cfg.hypervisor.snp_host_data,
                 )
             })
             .transpose()
