@@ -8005,6 +8005,7 @@ dependencies = [
 name = "snp_bootshim"
 version = "0.0.0"
 dependencies = [
+ "igvm_defs",
  "loader_defs",
  "minimal_rt",
  "minimal_rt_build",

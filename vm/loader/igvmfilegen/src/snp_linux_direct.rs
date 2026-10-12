@@ -17,6 +17,7 @@ use igvmfilegen_config::ResourceType;
 use igvmfilegen_config::Resources;
 use igvmfilegen_config::SnpInjectionType;
 use loader::importer::BootPageAcceptance;
+use loader::importer::IgvmParameterType;
 use loader::importer::ImageLoad;
 use loader::importer::X86Register;
 use loader::linux::InitrdAddressType;
@@ -26,9 +27,14 @@ use loader_defs::linux::SNP_BOOT_SHIM_PARAMS_MAGIC;
 use loader_defs::linux::SNP_BOOT_SHIM_PARAMS_VERSION;
 use loader_defs::linux::SnpBootShimParams;
 use loader_defs::linux::SnpBootShimRange;
+use loader_defs::linux::{
+    SNP_BOOT_SHIM_HIGH_RAM, SNP_BOOT_SHIM_LAUNCH_PAGES, SNP_BOOT_SHIM_LOW_MMIO,
+    SNP_BOOT_SHIM_MADT_OFFSET,
+};
 use memory_range::MemoryRange;
-use serial_16550_resources::ComPort;
 use std::io::Seek;
+use vm_topology::layout::LayoutBuilder;
+use vm_topology::layout::Placement;
 use vm_topology::memory::MemoryLayout;
 use vm_topology::pcie::PcieHostBridge;
 use vm_topology::processor::ProcessorTopology;
@@ -86,10 +92,55 @@ impl FixedGuestLayout {
         // Match the single RAM node instead of inheriting per-socket vnodes.
         processors.set_vnodes(&vec![0; processor_count as usize]);
 
+        let mut ecam_range = MemoryRange::EMPTY;
+        let mut low_mmio = MemoryRange::EMPTY;
+        let mut high_mmio = MemoryRange::EMPTY;
+        let mut ram = Vec::new();
+        let mut allocator = LayoutBuilder::new();
+        allocator.fixed("chipset-low", MemoryRange::new(0xf800_0000..0x1_0000_0000));
+        allocator.request(
+            "ecam",
+            &mut ecam_range,
+            0x0800_0000,
+            0x10_0000,
+            Placement::Mmio32,
+        );
+        allocator.request(
+            "pci-low",
+            &mut low_mmio,
+            0x1000_0000,
+            0x20_0000,
+            Placement::Mmio32,
+        );
+        allocator.request(
+            "pci-high",
+            &mut high_mmio,
+            0x4_0000_0000,
+            0x20_0000,
+            Placement::Mmio64,
+        );
+        allocator.ram("ram", &mut ram, memory_size, PAGE_SIZE);
+        allocator
+            .allocate()
+            .context("allocating diagnostic PCIe layout")?;
+        tracing::info!(?ecam_range, ?low_mmio, ?high_mmio, "diagnostic PCIe layout");
+
         Ok(Self {
             memory,
             processors,
-            pcie_host_bridges: Vec::new(),
+            pcie_host_bridges: vec![PcieHostBridge {
+                index: 0,
+                segment: 0,
+                start_bus: 0,
+                end_bus: 127,
+                ecam_range,
+                low_mmio,
+                high_mmio,
+                cxl: None,
+                vnode: None,
+                preserve_bars: false,
+                preserve_boot_config: false,
+            }],
         })
     }
 
@@ -192,11 +243,33 @@ pub fn build(params: BuildParams<'_>) -> anyhow::Result<IgvmOutput> {
     } = params;
 
     let layout = FixedGuestLayout::new(memory_page_count, processor_count)?;
-    let acpi_builder = layout.acpi_builder();
+    let mut acpi_builder = layout.acpi_builder();
+    ensure!(
+        processor_count == 1,
+        "launch-time CPU tables need only the BSP template: set processor_count to 1"
+    );
+    ensure!(
+        c_bit_position == 51,
+        "launch-sizing prototype requires C-bit 51"
+    );
+    ensure!(
+        memory_page_count * PAGE_SIZE <= SNP_BOOT_SHIM_LOW_MMIO,
+        "minimum launch RAM overlaps PCI MMIO"
+    );
+    // Reserve two measured SRAT memory-affinity slots for the shim to fill.
+    let launch_acpi_memory = MemoryLayout::new(
+        SNP_BOOT_SHIM_LOW_MMIO + PAGE_SIZE,
+        &[MemoryRange::new(
+            SNP_BOOT_SHIM_LOW_MMIO..SNP_BOOT_SHIM_HIGH_RAM,
+        )],
+        &[],
+        &[],
+        None,
+    )?;
+    acpi_builder.mem_layout = &launch_acpi_memory;
     let (mut kernel, mut initrd) = open_linux_resources(linux, resources)?;
     let initrd_config = initrd_config(&mut initrd)?;
     let mut loader = new_loader(policy, c_bit_position, memory_page_count, injection_type);
-    let com1 = ComPort::Com1;
 
     let load_info = loader::linux::load_x86(
         &mut loader.loader(),
@@ -207,7 +280,6 @@ pub fn build(params: BuildParams<'_>) -> anyhow::Result<IgvmOutput> {
         |gpa| {
             let tables = acpi_builder.build_acpi_tables(gpa, |dsdt| {
                 dsdt.add_apic();
-                dsdt.add_uart(b"\\_SB.UAR1", b"COM1", 1, com1.io_port(), com1.irq().into());
                 dsdt.add_rtc();
             });
             loader::linux::AcpiTables {
@@ -293,6 +365,9 @@ fn load_bootshim_and_handoff(
         "SNP bootshim parameter page lies outside configured RAM"
     );
 
+    let launch_gpa = params_gpa + PAGE_SIZE;
+    import_launch_params(loader, launch_gpa, memory_page_count * PAGE_SIZE)?;
+
     let bootshim_ranges = loader
         .unimported_ram_ranges([params_page])?
         .into_iter()
@@ -306,6 +381,7 @@ fn load_bootshim_and_handoff(
         linux_entry,
         linux_zero_page,
         memory_page_count * PAGE_SIZE,
+        launch_gpa,
         &bootshim_ranges,
     )?;
     {
@@ -324,6 +400,39 @@ fn load_bootshim_and_handoff(
     }
 
     Ok(bootshim_ranges)
+}
+
+fn import_launch_params(
+    loader: &mut IgvmLoader<X86Register>,
+    launch_gpa: u64,
+    ram_end: u64,
+) -> anyhow::Result<()> {
+    ensure!(
+        launch_gpa
+            .checked_add(u64::from(SNP_BOOT_SHIM_LAUNCH_PAGES) * PAGE_SIZE)
+            .is_some_and(|end| end <= ram_end),
+        "launch parameter area lies outside minimum RAM"
+    );
+    let mut importer = loader.loader();
+    let area = importer.create_parameter_area(
+        launch_gpa / PAGE_SIZE,
+        SNP_BOOT_SHIM_LAUNCH_PAGES,
+        "snp-launch-params",
+    )?;
+    importer.import_parameter(
+        area,
+        core::mem::offset_of!(loader_defs::linux::SnpBootShimLaunchParams, processor_count)
+            .try_into()?,
+        IgvmParameterType::VpCount,
+    )?;
+    importer.import_parameter(
+        area,
+        core::mem::offset_of!(loader_defs::linux::SnpBootShimLaunchParams, memory_map)
+            .try_into()?,
+        IgvmParameterType::MemoryMap,
+    )?;
+    importer.import_parameter(area, SNP_BOOT_SHIM_MADT_OFFSET, IgvmParameterType::Madt)?;
+    Ok(())
 }
 
 fn align_up_to_page(value: u64) -> u64 {
@@ -350,6 +459,7 @@ fn build_bootshim_params(
     linux_entry: u64,
     linux_zero_page: u64,
     ram_end: u64,
+    launch_gpa: u64,
     ranges: &[SnpBootShimRange],
 ) -> anyhow::Result<SnpBootShimParams> {
     ensure!(
@@ -368,6 +478,7 @@ fn build_bootshim_params(
     params.linux_entry = linux_entry;
     params.linux_zero_page = linux_zero_page;
     params.ram_end = ram_end;
+    params.launch_params_gpa = launch_gpa;
     params.ranges[..ranges.len()].copy_from_slice(ranges);
     Ok(params)
 }
@@ -521,7 +632,12 @@ mod tests {
                     assert!(!vtl2_protectable);
                     required_memory_count += 1;
                 }
-                unexpected => panic!("unexpected directive in fixed SNP IGVM: {unexpected:?}"),
+                IgvmDirectiveHeader::ParameterArea { .. }
+                | IgvmDirectiveHeader::ParameterInsert(_)
+                | IgvmDirectiveHeader::VpCount(_)
+                | IgvmDirectiveHeader::MemoryMap(_)
+                | IgvmDirectiveHeader::Madt(_) => {}
+                unexpected => panic!("unexpected directive in SNP IGVM: {unexpected:?}"),
             }
         }
 
@@ -678,7 +794,7 @@ mod tests {
 
     #[test]
     fn sparse_igvm_serializes_and_preserves_measurement() {
-        const RAM_PAGE_COUNT: u64 = 8;
+        const RAM_PAGE_COUNT: u64 = 16;
         const PARAMS_PAGE: u64 = 6;
         let params_gpa = PARAMS_PAGE * PAGE_SIZE;
         let mut loader = test_loader(RAM_PAGE_COUNT);
@@ -692,8 +808,10 @@ mod tests {
                 .unwrap();
         }
 
+        let launch_gpa = (PARAMS_PAGE + 1) * PAGE_SIZE;
+        import_launch_params(&mut loader, launch_gpa, RAM_PAGE_COUNT * PAGE_SIZE).unwrap();
         let ranges = loader.unimported_ram_ranges([PARAMS_PAGE]).unwrap();
-        assert_eq!(ranges, [0..1, 3..6, 7..8]);
+        assert_eq!(ranges, [0..1, 3..6, 10..16]);
         let ranges = ranges
             .iter()
             .map(|range| SnpBootShimRange {
@@ -705,6 +823,7 @@ mod tests {
             0x200000,
             loader::linux::ZERO_PAGE_BASE,
             RAM_PAGE_COUNT * PAGE_SIZE,
+            launch_gpa,
             &ranges,
         )
         .unwrap();
@@ -764,6 +883,38 @@ mod tests {
         );
         assert_eq!(handoff, Some((TEST_SHIM_ENTRY, params_gpa)));
         assert_eq!(serialized_params, Some(params));
+        assert_eq!(params.version, SNP_BOOT_SHIM_PARAMS_VERSION);
+        assert_eq!(params.launch_params_gpa, launch_gpa);
+        let directives = output.guest.directives();
+        assert_eq!(
+            directives
+                .iter()
+                .filter(|d| matches!(d, IgvmDirectiveHeader::ParameterArea { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            directives
+                .iter()
+                .filter(|d| matches!(d, IgvmDirectiveHeader::ParameterInsert(_)))
+                .count(),
+            1
+        );
+        assert!(
+            directives
+                .iter()
+                .any(|d| matches!(d, IgvmDirectiveHeader::VpCount(_)))
+        );
+        assert!(
+            directives
+                .iter()
+                .any(|d| matches!(d, IgvmDirectiveHeader::MemoryMap(_)))
+        );
+        assert!(
+            directives
+                .iter()
+                .any(|d| matches!(d, IgvmDirectiveHeader::Madt(_)))
+        );
         assert_serialized_igvm_shape(
             &output.guest,
             RAM_PAGE_COUNT,
@@ -834,11 +985,18 @@ mod tests {
             SNP_BOOT_SHIM_MAX_RANGES + 1
         ];
         assert!(
-            build_bootshim_params(0x100000, 0x2000, 0x200000, &ranges)
+            build_bootshim_params(0x100000, 0x2000, 0x200000, 0x180000, &ranges)
                 .unwrap_err()
                 .to_string()
                 .contains("supports at most")
         );
+    }
+
+    #[test]
+    fn rejects_launch_area_outside_minimum_ram() {
+        let mut loader = test_loader(16);
+        assert!(import_launch_params(&mut loader, 14 * PAGE_SIZE, 16 * PAGE_SIZE).is_err());
+        assert!(import_launch_params(&mut loader, u64::MAX - PAGE_SIZE + 1, u64::MAX).is_err());
     }
 
     #[test]

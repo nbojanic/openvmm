@@ -1,0 +1,21 @@
+DO NOT MERGE - temporary Kata boot-tooling source snapshot
+
+This branch exists to unblock parallel MAP/AgentBaker build work.
+It is not an approved release or a completed boot-code review.
+
+Base: openvmm-v0.2.0, 49742cf0636bdda0dc94757d6185e5e50254873c.
+The Cargo.lock and vm/loader changes are the current review snapshot.
+They include the PCI platform prerequisite, launch-only sizing, runtime
+CPU-table construction, canonical IGVM memory-map entries, and the
+katashim/version-1 handoff with its memory map at offset 8.
+
+Build generator and bootshim from the same source. Do not mix them with
+older SNPBSHIM handoff images.
+
+Earlier prototype images passed E2E; this snapshot includes subsequent
+review changes. Latest compilation was blocked by a full remote build disk.
+No hardware-boot or full-E2E claim is made for this exact source snapshot.
+
+The packaged OpenVMM runtime is separate: this branch is a tooling input,
+not an instruction to replace the validated runtime buddy package.
+No prebuilt IGVMs, kernel binaries or private EFI payloads are included.

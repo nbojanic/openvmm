@@ -9,6 +9,7 @@
 #![expect(missing_docs)]
 #![expect(non_camel_case_types)]
 
+use igvm_defs::IGVM_VHS_MEMORY_MAP_ENTRY;
 use static_assertions::const_assert_eq;
 use zerocopy::FromBytes;
 use zerocopy::FromZeros;
@@ -296,10 +297,50 @@ pub struct cc_setup_data {
     pub _padding: [u32; 3],
 }
 
-/// Magic value for a measured [`SnpBootShimParams`] page.
-pub const SNP_BOOT_SHIM_PARAMS_MAGIC: u64 = u64::from_le_bytes(*b"SNPBSHIM");
-/// Version of the [`SnpBootShimParams`] handoff ABI.
+/// Identifies the Kata-specific measured [`SnpBootShimParams`] handoff.
+pub const SNP_BOOT_SHIM_PARAMS_MAGIC: u64 = u64::from_le_bytes(*b"katashim");
+/// Version of the Kata handoff ABI.
 pub const SNP_BOOT_SHIM_PARAMS_VERSION: u32 = 1;
+/// One 4-KiB page for CPU count/memory map, followed by two pages for host MADT.
+pub const SNP_BOOT_SHIM_LAUNCH_PAGES: u32 = 3;
+/// Start MADT on the next page, separate from the fixed-size launch header.
+pub const SNP_BOOT_SHIM_MADT_OFFSET: u32 = hvdef::HV_PAGE_SIZE as u32;
+/// Bound untrusted MADT input to two pages; enough for the supported CPU count.
+pub const SNP_BOOT_SHIM_MADT_SIZE: usize = 2 * hvdef::HV_PAGE_SIZE as usize;
+/// Prototype CPU capacity, matched by the Kata image's nr_cpus=256 command line
+/// (Only up to 32 tested so far).
+pub const SNP_BOOT_SHIM_MAX_CPUS: usize = 256;
+/// We generate two ACPI output tables, MADT and SRAT, each with its own two-page
+/// buffer. For 256 CPUs, their x2APIC records occupy 4096 and 6144 bytes,
+/// respectively, leaving room for headers and the remaining platform/memory records.
+pub const SNP_BOOT_SHIM_CPU_TABLE_SIZE: usize = 2 * hvdef::HV_PAGE_SIZE as usize;
+/// 3.5-GiB low-RAM ceiling: the measured PCI platform places ECAM here,
+/// followed by low PCI MMIO and the chipset reservation below 4 GiB.
+pub const SNP_BOOT_SHIM_LOW_MMIO: u64 = 0xe000_0000;
+/// High RAM starts at 4 GiB, beyond the platform's low-address MMIO hole.
+pub const SNP_BOOT_SHIM_HIGH_RAM: u64 = 0x1_0000_0000;
+/// Initial measured PCI high-MMIO window ends at 20 GiB: a 16-GiB aperture
+/// starting at 4 GiB. The shim relocates it above actual RAM without resizing it.
+pub const SNP_BOOT_SHIM_HIGH_MMIO_END: u64 = 0x5_0000_0000;
+/// Exclusive RAM-address bound covered by the bootshim's 64-GiB identity map.
+/// Increasing this also requires extending map_high_memory()'s page tables.
+pub const SNP_BOOT_SHIM_MAX_GPA: u64 = 64 << 30;
+/// Tested prototype total-RAM cap, not an architectural SNP limit. Separate
+/// from MAX_GPA because the MMIO hole makes the RAM end exceed its byte count.
+pub const SNP_BOOT_SHIM_MAX_RAM: u64 = 32 << 30;
+
+/// Layout of the VpCount and MemoryMap inputs requested by the generator.
+/// This prototype supports one low RAM range, one high RAM range and a
+/// zero terminator. These fields are untrusted, unlike SnpBootShimParams.
+#[repr(C)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct SnpBootShimLaunchParams {
+    pub processor_count: u32,
+    /// Explicit padding keeps the canonical IGVM entries naturally 8-byte aligned.
+    pub reserved: [u8; 4],
+    pub memory_map: [IGVM_VHS_MEMORY_MAP_ENTRY; 3],
+}
+
 const SNP_BOOT_SHIM_PARAMS_HEADER_SIZE: usize = 48;
 /// Maximum number of RAM ranges that fit in one [`SnpBootShimParams`] page.
 pub const SNP_BOOT_SHIM_MAX_RANGES: usize = (hvdef::HV_PAGE_SIZE as usize
@@ -334,10 +375,10 @@ pub struct SnpBootShimParams {
     pub linux_entry: u64,
     /// Guest physical address of the Linux zero page passed in RSI.
     pub linux_zero_page: u64,
-    /// Exclusive end of the configured, contiguous guest RAM.
+    /// Exclusive end of the minimum contiguous RAM supplied by the image.
     pub ram_end: u64,
-    /// Reserved for future ABI versions and must be zero.
-    pub reserved: u64,
+    /// GPA of the required unmeasured launch parameter area.
+    pub launch_params_gpa: u64,
     /// Sorted, non-overlapping RAM ranges omitted from measured page data.
     pub ranges: [SnpBootShimRange; SNP_BOOT_SHIM_MAX_RANGES],
 }

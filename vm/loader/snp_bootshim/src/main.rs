@@ -22,10 +22,14 @@
 // only tests and the minimal-runtime entry point call it.
 #![cfg_attr(not(any(minimal_rt, test)), allow(dead_code))]
 
+use loader_defs::linux::SNP_BOOT_SHIM_LAUNCH_PAGES;
 use loader_defs::linux::SNP_BOOT_SHIM_PARAMS_MAGIC;
 use loader_defs::linux::SNP_BOOT_SHIM_PARAMS_VERSION;
 use loader_defs::linux::SnpBootShimParams;
 use loader_defs::linux::SnpBootShimRange;
+
+mod cpu_tables;
+mod launch;
 
 const PAGE_SIZE: u64 = 4096;
 
@@ -38,7 +42,6 @@ enum ParamsError {
     InvalidRamEnd,
     InvalidLinuxEntry,
     InvalidLinuxZeroPage,
-    ReservedNotZero,
     EmptyRange,
     RangeOverflow,
     RangeOutsideRam,
@@ -74,8 +77,15 @@ fn validate_params(
     if params.ram_end == 0 || !params.ram_end.is_multiple_of(PAGE_SIZE) {
         return Err(ParamsError::InvalidRamEnd);
     }
-    if params.reserved != 0 {
-        return Err(ParamsError::ReservedNotZero);
+    if params.launch_params_gpa == 0
+        || !params.launch_params_gpa.is_multiple_of(PAGE_SIZE)
+        || params.launch_params_gpa == params_gpa
+        || params
+            .launch_params_gpa
+            .checked_add(u64::from(SNP_BOOT_SHIM_LAUNCH_PAGES) * PAGE_SIZE)
+            .is_none_or(|end| end > params.ram_end)
+    {
+        return Err(ParamsError::RangeOutsideRam);
     }
     let params_end = params_gpa
         .checked_add(PAGE_SIZE)
@@ -122,6 +132,11 @@ fn validate_params(
             return Err(ParamsError::UnorderedRanges);
         }
         if start < params_end && params_gpa < end {
+            return Err(ParamsError::ParamsRangeOverlap);
+        }
+        if start < params.launch_params_gpa + u64::from(SNP_BOOT_SHIM_LAUNCH_PAGES) * PAGE_SIZE
+            && params.launch_params_gpa < end
+        {
             return Err(ParamsError::ParamsRangeOverlap);
         }
         previous_end = end;
@@ -340,6 +355,17 @@ fn jump_to_linux() -> ! {
 }
 
 #[cfg(minimal_rt)]
+fn launch_fault(code: u64) -> ! {
+    // SAFETY: Report a non-secret bootstrap error through the GHCB termination
+    // protocol so invalid launch input fails closed with a host-visible reason.
+    unsafe {
+        minimal_rt::arch::msr::write_msr(x86defs::X86X_AMD_MSR_GHCB, 0x100 | (code << 12));
+        core::arch::asm!("rep vmmcall", options(nostack));
+    }
+    minimal_rt::arch::fault()
+}
+
+#[cfg(minimal_rt)]
 extern "C" fn start(params_gpa: u64) -> ! {
     if !params_gpa.is_multiple_of(PAGE_SIZE) {
         minimal_rt::arch::fault();
@@ -350,12 +376,38 @@ extern "C" fn start(params_gpa: u64) -> ! {
     let params = unsafe { &*(params_gpa as *const SnpBootShimParams) };
     let ranges = match validate_params(params, params_gpa) {
         Ok(ranges) => ranges,
-        Err(_) => minimal_rt::arch::fault(),
+        Err(error) => launch_fault(0x50 + error as u64),
     };
+
+    // SAFETY: The measured handoff selects this imported, private but
+    // unmeasured page. Snapshot it once and validate before using it.
+    let input = unsafe {
+        core::ptr::read_volatile(
+            params.launch_params_gpa as *const loader_defs::linux::SnpBootShimLaunchParams,
+        )
+    };
+    let memory = launch::validate_launch(&input, params.ram_end)
+        .unwrap_or_else(|error| launch_fault(0x10 + error as u64));
+    launch::update_linux(params, &memory).unwrap_or_else(|error| launch_fault(0x20 + error as u64));
+    launch::map_high_memory();
 
     for &range in ranges {
         if arch::accept_range(range).is_err() {
-            minimal_rt::arch::fault();
+            launch_fault(0x30);
+        }
+    }
+    for (index, range) in memory.ranges[..memory.count].iter().enumerate() {
+        let start_gpn = if index == 0 {
+            params.ram_end / PAGE_SIZE
+        } else {
+            range.start_gpn
+        };
+        let extra = SnpBootShimRange {
+            start_gpn,
+            page_count: range.start_gpn + range.page_count - start_gpn,
+        };
+        if arch::accept_range(extra).is_err() {
+            launch_fault(0x40);
         }
     }
 
@@ -400,7 +452,7 @@ mod tests {
             linux_entry: 0x10_0000,
             linux_zero_page: 0x2000,
             ram_end: 0x20_0000,
-            reserved: 0,
+            launch_params_gpa: 0x180000,
             ranges: {
                 let mut ranges = [SnpBootShimRange {
                     start_gpn: 0,
@@ -427,6 +479,23 @@ mod tests {
     }
 
     #[test]
+    fn validates_launch_parameter_page_and_rejects_overlap() {
+        let mut params = valid_params();
+        params.launch_params_gpa = 0x180000;
+        assert!(validate_params(&params, 0x1000).is_ok());
+        params.launch_params_gpa = 0x1000;
+        assert_eq!(
+            validate_params(&params, 0x1000),
+            Err(ParamsError::RangeOutsideRam)
+        );
+        params.launch_params_gpa = 0x4000;
+        assert_eq!(
+            validate_params(&params, 0x1000),
+            Err(ParamsError::ParamsRangeOverlap)
+        );
+    }
+
+    #[test]
     fn validates_ordered_multiple_ranges() {
         let params = valid_params();
         assert_eq!(
@@ -438,18 +507,22 @@ mod tests {
     #[test]
     fn rejects_bad_magic_and_version() {
         let mut params = valid_params();
-        params.magic = 0;
-        assert_eq!(
-            validate_params(&params, 0x1000),
-            Err(ParamsError::InvalidMagic)
-        );
+        for magic in [0, u64::from_le_bytes(*b"SNPBSHIM")] {
+            params.magic = magic;
+            assert_eq!(
+                validate_params(&params, 0x1000),
+                Err(ParamsError::InvalidMagic)
+            );
+        }
 
         params = valid_params();
-        params.version += 1;
-        assert_eq!(
-            validate_params(&params, 0x1000),
-            Err(ParamsError::UnsupportedVersion)
-        );
+        for version in [0, SNP_BOOT_SHIM_PARAMS_VERSION + 1] {
+            params.version = version;
+            assert_eq!(
+                validate_params(&params, 0x1000),
+                Err(ParamsError::UnsupportedVersion)
+            );
+        }
     }
 
     #[test]
@@ -587,7 +660,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_too_many_ranges_and_nonzero_reserved_data() {
+    fn rejects_too_many_ranges_and_invalid_launch_area() {
         let mut params = valid_params();
         params.range_count = (SNP_BOOT_SHIM_MAX_RANGES + 1) as u32;
         assert_eq!(
@@ -595,11 +668,13 @@ mod tests {
             Err(ParamsError::TooManyRanges)
         );
 
-        params = valid_params();
-        params.reserved = 1;
-        assert_eq!(
-            validate_params(&params, 0x1000),
-            Err(ParamsError::ReservedNotZero)
-        );
+        for address in [0, 1, 0x1ff000, !(PAGE_SIZE - 1)] {
+            params = valid_params();
+            params.launch_params_gpa = address;
+            assert_eq!(
+                validate_params(&params, 0x1000),
+                Err(ParamsError::RangeOutsideRam)
+            );
+        }
     }
 }

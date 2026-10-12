@@ -128,9 +128,9 @@ pub enum Image {
     SnpLinuxDirect {
         /// The Linux image to load.
         linux: LinuxImage,
-        /// The number of virtual processors in the guest.
+        /// The BSP template count; must be one. Actual CPU count comes from launch parameters.
         processor_count: u32,
-        /// The number of pages in the guest.
+        /// The minimum number of RAM pages required by the image.
         memory_page_count: u64,
         /// The page-table address bit used as the SNP encryption bit.
         c_bit_position: u8,
@@ -181,8 +181,8 @@ impl Image {
             ..
         } = *self
         {
-            if processor_count == 0 {
-                return Err(ImageValidationError::ZeroProcessorCount);
+            if processor_count != 1 {
+                return Err(ImageValidationError::InvalidProcessorCount);
             }
             if memory_page_count == 0 {
                 return Err(ImageValidationError::ZeroMemoryPageCount);
@@ -213,9 +213,9 @@ impl Image {
 /// Error returned when an image configuration contains invalid intrinsic fields.
 #[derive(Debug, thiserror::Error, Clone, Copy, PartialEq, Eq)]
 pub enum ImageValidationError {
-    /// The image requests no virtual processors.
-    #[error("processor_count must be nonzero")]
-    ZeroProcessorCount,
+    /// Only the BSP template is generated; CPUs are enumerated at launch.
+    #[error("processor_count must be 1 for the BSP template")]
+    InvalidProcessorCount,
     /// The image requests no guest memory.
     #[error("memory_page_count must be nonzero")]
     ZeroMemoryPageCount,
@@ -435,6 +435,17 @@ mod test {
     }
 
     #[test]
+    fn snp_linux_direct_has_no_sizing_mode_switch() {
+        let image = snp_linux_direct_image(false, 1, 131072, 51);
+        let serialized = serde_json::to_value(&image).unwrap();
+        let fields = serialized["snp_linux_direct"].as_object().unwrap();
+        assert_eq!(fields.len(), 4);
+        assert!(!fields.contains_key("launch_time_sizing"));
+        let parsed: Image = serde_json::from_value(serialized).unwrap();
+        parsed.validate().unwrap();
+    }
+
+    #[test]
     fn parse_snp_linux_direct_manifest() {
         let config: Config =
             serde_json::from_str(include_str!("../../manifests/snp-linux-direct.json")).unwrap();
@@ -468,6 +479,7 @@ mod test {
                 processor_count,
                 memory_page_count,
                 c_bit_position,
+                ..
             } => {
                 assert!(linux.use_initrd);
                 assert_eq!(
@@ -498,7 +510,7 @@ mod test {
         else {
             panic!("expected SNP Linux-direct image");
         };
-        assert_eq!(*processor_count, 2);
+        assert_eq!(*processor_count, 1);
         guest.image.validate().unwrap();
     }
 
@@ -601,13 +613,14 @@ mod test {
     }
 
     #[test]
-    fn snp_linux_direct_rejects_zero_processors() {
-        let image = snp_linux_direct_image(false, 0, 40960, 51);
-
-        assert_eq!(
-            image.validate(),
-            Err(ImageValidationError::ZeroProcessorCount)
-        );
+    fn snp_linux_direct_requires_bsp_template() {
+        for count in [0, 2, 256] {
+            let image = snp_linux_direct_image(false, count, 40960, 51);
+            assert_eq!(
+                image.validate(),
+                Err(ImageValidationError::InvalidProcessorCount)
+            );
+        }
     }
 
     #[test]
