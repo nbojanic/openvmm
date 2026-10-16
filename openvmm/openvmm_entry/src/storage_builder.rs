@@ -131,6 +131,10 @@ fn open_auto_disks(
 ) -> anyhow::Result<(Resource<DiskHandleKind>, Resource<DiskHandleKind>)> {
     let bounce = open_reviewed_disk(kind, read_only)?;
     let direct = match &bounce {
+        #[cfg(target_os = "linux")]
+        VirtioBlkBounceDiskHandle::BlockDevice(_) => {
+            anyhow::bail!("CLI bounce disks do not support host block devices");
+        }
         VirtioBlkBounceDiskHandle::Ram { len } => {
             disk_backend_resources::LayeredDiskHandle::single_layer(
                 disk_backend_resources::layer::RamDiskLayerHandle {

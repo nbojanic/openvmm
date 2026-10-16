@@ -139,11 +139,16 @@ pub mod blk {
     ///
     /// File handles must refer to regular buffered files. On Linux, neither
     /// `O_DIRECT` nor `O_APPEND` is supported. Other disk resources, including
-    /// arbitrary layered disks and host block devices, are not supported.
+    /// arbitrary layered disks, are not supported. Linux block devices use
+    /// the separate buffered `BlockDevice` variant.
     #[derive(MeshPayload)]
     pub enum VirtioBlkBounceDiskHandle {
         File(std::fs::File),
-        Ram { len: u64 },
+        Ram {
+            len: u64,
+        },
+        #[cfg(target_os = "linux")]
+        BlockDevice(std::fs::File),
     }
 
     impl ResourceId<DiskHandleKind> for VirtioBlkBounceDiskHandle {

@@ -551,6 +551,7 @@ struct Vm {
     scsi_rpc: Option<mesh::Sender<ScsiControllerRequest>>,
     consomme_rpc: Option<mesh::Sender<ConsommeRequest>>,
     iommufds: Arc<IommufdContexts>,
+    snp_bounce: bool,
 }
 
 #[derive(Default)]
@@ -668,7 +669,6 @@ fn validate_snp_bounce_config(
         config.disable_vmbus
             && config.hvsocket_config.is_none()
             && config.iommufds.is_empty()
-            && config.pcie.is_none()
             && config.crash_dump_path.is_none()
             && config.devices_config.as_ref().is_none_or(|devices| {
                 devices.scsi_disks.is_empty()
@@ -679,7 +679,7 @@ fn validate_snp_bounce_config(
                         .as_ref()
                         .is_none_or(|console| console.socket_path.is_empty())
             }),
-        "VM-service MSHV SNP only supports the minimal chipset and serial, without crash dumps; use the CLI for bounced virtio devices"
+        "VM-service MSHV SNP requires the minimal chipset with bounced PCIe virtio devices, without crash dumps"
     );
     if let Some(numa) = &config.numa_config {
         for memory in numa.nodes.iter().filter_map(|node| node.memory.as_ref()) {
@@ -1168,7 +1168,7 @@ impl VmService {
         // Build the PCIe topology (root complexes, switches, and the devices
         // attached behind their ports).
         let pcie = if let Some(pcie) = req_config.pcie.take() {
-            build_pcie_topology(pcie, &registry, &iommufds).await?
+            build_pcie_topology(pcie, &registry, &iommufds, snp_bounce).await?
         } else {
             BuiltPcieTopology::default()
         };
@@ -1179,7 +1179,8 @@ impl VmService {
             ide_disks: vec![],
             floppy_disks: vec![],
             pcie_root_complexes: pcie.root_complexes,
-            pcie_ecam_below_4gb: false,
+            // Match the low ECAM embedded in Kata's SNP IGVM.
+            pcie_ecam_below_4gb: snp_bounce,
             pcie_devices: pcie.devices,
             pcie_switches: pcie.switches,
             pcie_generic_initiators: pcie.generic_initiators,
@@ -1404,6 +1405,7 @@ impl VmService {
             consomme_rpc,
             worker_rpc: send,
             iommufds: Arc::new(iommufds),
+            snp_bounce,
         }));
         self.lifecycle = VmLifecycle::Paused;
         Ok(())
@@ -1547,13 +1549,19 @@ impl VmService {
         request: vmservice::AddPcieDeviceRequest,
     ) -> anyhow::Result<impl Future<Output = anyhow::Result<()>> + use<>> {
         let vm = self.vm.as_ref().context("VM not created yet")?;
+        let snp_bounce = vm.snp_bounce;
         let worker_rpc = vm.worker_rpc.clone();
         let iommufds = vm.iommufds.clone();
         let registry = self.registry.clone();
         Ok(async move {
             let vmservice::AddPcieDeviceRequest { port_name, device } = request;
-            let resource =
-                build_pci_device(device.context("missing device")?, &registry, &iommufds).await?;
+            let resource = build_pci_device(
+                device.context("missing device")?,
+                &registry,
+                &iommufds,
+                snp_bounce,
+            )
+            .await?;
             worker_rpc
                 .call_failable(VmRpc::AddPcieDevice, (port_name, resource))
                 .await
@@ -1579,6 +1587,7 @@ impl VmService {
         request: vmservice::AddVpciDeviceRequest,
     ) -> anyhow::Result<impl Future<Output = anyhow::Result<()>> + use<>> {
         let vm = self.vm.as_ref().context("VM not created yet")?;
+        anyhow::ensure!(!vm.snp_bounce, "MSHV SNP does not support VPCI devices");
         let worker_rpc = vm.worker_rpc.clone();
         let iommufds = vm.iommufds.clone();
         let registry = self.registry.clone();
@@ -1591,6 +1600,7 @@ impl VmService {
                 request.device.context("missing device")?,
                 &registry,
                 &iommufds,
+                false,
             )
             .await?;
             worker_rpc
@@ -2019,11 +2029,19 @@ async fn build_pcie_topology(
     topology: vmservice::PcieTopologyConfig,
     registry: &FdRegistry,
     iommufds: &IommufdContexts,
+    snp_bounce: bool,
 ) -> anyhow::Result<BuiltPcieTopology> {
     let vmservice::PcieTopologyConfig {
         root_complexes: proto_root_complexes,
         generic_initiators,
     } = topology;
+    if snp_bounce {
+        anyhow::ensure!(
+            generic_initiators.is_empty()
+                && proto_root_complexes.iter().all(|rc| rc.iommu.is_none()),
+            "MSHV SNP does not support PCIe IOMMUs or generic initiators"
+        );
+    }
     let mut root_complexes = Vec::new();
     let mut switches = Vec::new();
     // Devices are built after the topology walk so that the (async) device
@@ -2090,7 +2108,7 @@ async fn build_pcie_topology(
 
     let mut devices = Vec::new();
     for (port_name, device) in pending_devices {
-        let resource = build_pci_device(device, registry, iommufds).await?;
+        let resource = build_pci_device(device, registry, iommufds, snp_bounce).await?;
         devices.push(PcieDeviceConfig {
             port_name,
             resource,
@@ -2202,12 +2220,19 @@ async fn build_pci_device(
     device: vmservice::PcieDeviceKind,
     registry: &FdRegistry,
     iommufds: &IommufdContexts,
+    snp_bounce: bool,
 ) -> anyhow::Result<Resource<PciDeviceHandleKind>> {
     use vmservice::pcie_device_kind::Kind;
     let vmservice::PcieDeviceKind { kind } = device;
+    if snp_bounce {
+        anyhow::ensure!(
+            matches!(&kind, Some(Kind::Virtio(_))),
+            "MSHV SNP requires bounced virtio PCIe endpoints"
+        );
+    }
     Ok(match kind.context("missing PCIe device kind")? {
         Kind::Virtio(virtio) => {
-            let resource = build_virtio_device(virtio, registry).await?;
+            let resource = build_virtio_device(virtio, registry, snp_bounce).await?;
             VirtioPciDeviceHandle(resource).into_resource()
         }
         Kind::Nvme(nvme) => build_nvme_controller(nvme).await?,
@@ -2364,17 +2389,33 @@ async fn build_nvme_controller(
 async fn build_virtio_device(
     device: vmservice::VirtioDevice,
     registry: &FdRegistry,
+    snp_bounce: bool,
 ) -> anyhow::Result<Resource<VirtioDeviceHandle>> {
     use vmservice::virtio_device::Kind;
     let vmservice::VirtioDevice { kind } = device;
+    if snp_bounce {
+        anyhow::ensure!(
+            matches!(
+                &kind,
+                Some(
+                    Kind::Blk(_) | Kind::Net(_) | Kind::Rng(_) | Kind::Vsock(_) | Kind::Console(_)
+                )
+            ),
+            "MSHV SNP supports only block, software net/vsock, RNG and console virtio devices"
+        );
+    }
     Ok(match kind.context("missing virtio device kind")? {
         Kind::Blk(vmservice::VirtioBlk {
             backend,
             read_only,
             serial,
         }) => {
-            let disk =
-                build_disk_backend(backend.context("missing blk backend")?, read_only).await?;
+            let backend = backend.context("missing blk backend")?;
+            let disk = if snp_bounce {
+                build_bounce_disk_backend(backend, read_only)?
+            } else {
+                build_disk_backend(backend, read_only).await?
+            };
             virtio_resources::blk::VirtioBlkHandle {
                 disk,
                 read_only,
@@ -2470,6 +2511,48 @@ fn build_virtio_fs(
 }
 
 /// Builds a disk backend resource from the proto `DiskBackend`.
+fn build_bounce_disk_backend(
+    backend: vmservice::DiskBackend,
+    read_only: bool,
+) -> anyhow::Result<Resource<DiskHandleKind>> {
+    use virtio_resources::blk::VirtioBlkBounceDiskHandle;
+    let Some(vmservice::disk_backend::Kind::File(vmservice::FileDisk { path, direct })) =
+        backend.kind
+    else {
+        anyhow::bail!("MSHV SNP requires a raw file or block-device backend");
+    };
+    anyhow::ensure!(!direct, "MSHV SNP requires buffered block backing");
+    let extension = std::path::Path::new(&path)
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    anyhow::ensure!(
+        !matches!(
+            extension.as_str(),
+            "vhd" | "vhdx" | "vmgs" | "qcow" | "qcow2" | "vmdk"
+        ),
+        "MSHV SNP bounce I/O requires raw disks"
+    );
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(!read_only)
+        .open(&path)
+        .with_context(|| format!("failed to open bounced disk {path}"))?;
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        if file.metadata()?.file_type().is_block_device() {
+            return Ok(VirtioBlkBounceDiskHandle::BlockDevice(file).into_resource());
+        }
+    }
+    anyhow::ensure!(
+        file.metadata()?.is_file(),
+        "expected raw file or block device"
+    );
+    Ok(VirtioBlkBounceDiskHandle::File(file).into_resource())
+}
+
 async fn build_disk_backend(
     backend: vmservice::DiskBackend,
     read_only: bool,
@@ -2708,10 +2791,6 @@ mod tests {
                 ..snp_service_config()
             },
             vmservice::VmConfig {
-                pcie: Some(Default::default()),
-                ..snp_service_config()
-            },
-            vmservice::VmConfig {
                 crash_dump_path: Some("path/to/dump".into()),
                 ..snp_service_config()
             },
@@ -2731,9 +2810,62 @@ mod tests {
                 validate_snp_bounce_config(&config, "mshv")
                     .unwrap_err()
                     .to_string()
-                    .contains("minimal chipset and serial")
+                    .contains("minimal chipset")
             );
             assert!(!validate_snp_bounce_config(&config, "kvm").unwrap());
+        }
+    }
+
+    #[test]
+    fn snp_service_accepts_pcie_but_rejects_unsupported_endpoints() {
+        let config = vmservice::VmConfig {
+            pcie: Some(Default::default()),
+            ..snp_service_config()
+        };
+        assert!(validate_snp_bounce_config(&config, "mshv").unwrap());
+        let registry = FdRegistry::default();
+        let iommufds = IommufdContexts::default();
+        let nvme = vmservice::PcieDeviceKind {
+            kind: Some(vmservice::pcie_device_kind::Kind::Nvme(Default::default())),
+        };
+        assert!(
+            futures::executor::block_on(build_pci_device(nvme, &registry, &iommufds, true))
+                .is_err()
+        );
+        let fs = vmservice::VirtioDevice {
+            kind: Some(vmservice::virtio_device::Kind::Fs(Default::default())),
+        };
+        assert!(futures::executor::block_on(build_virtio_device(fs, &registry, true)).is_err());
+        let result = futures::executor::block_on(build_pcie_topology(
+            vmservice::PcieTopologyConfig {
+                generic_initiators: vec![Default::default()],
+                ..Default::default()
+            },
+            &registry,
+            &iommufds,
+            true,
+        ));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn snp_service_rejects_direct_and_structured_disks() {
+        for (path, direct, expected) in [
+            ("unused.img", true, "buffered"),
+            ("unused.VHDX", false, "raw disks"),
+        ] {
+            let backend = vmservice::DiskBackend {
+                kind: Some(vmservice::disk_backend::Kind::File(vmservice::FileDisk {
+                    path: path.into(),
+                    direct,
+                })),
+            };
+            assert!(
+                build_bounce_disk_backend(backend, true)
+                    .unwrap_err()
+                    .to_string()
+                    .contains(expected)
+            );
         }
     }
 
@@ -2942,6 +3074,7 @@ mod tests {
                 },
                 &FdRegistry::default(),
                 &IommufdContexts::default(),
+                false,
             ));
             if has_iommu && !cfg!(guest_arch = "aarch64") {
                 assert!(result.is_err());
@@ -2976,6 +3109,7 @@ mod tests {
                         },
                         &FdRegistry::default(),
                         &IommufdContexts::default(),
+                        false,
                     ))
                     .unwrap();
                     let expected = pasid.unwrap_or(false);

@@ -35,6 +35,12 @@ fn validate_bounce_file(file: &std::fs::File) -> anyhow::Result<()> {
     if !file.metadata()?.is_file() {
         anyhow::bail!("bounce I/O requires a regular file, not a host device");
     }
+    validate_bounce_flags(file)
+}
+
+fn validate_bounce_flags(file: &std::fs::File) -> anyhow::Result<()> {
+    #[cfg(not(target_os = "linux"))]
+    let _ = file;
     #[cfg(target_os = "linux")]
     {
         use nix::fcntl::FcntlArg;
@@ -127,6 +133,16 @@ impl AsyncResolveResource<DiskHandleKind, VirtioBlkBounceDiskHandle> for VirtioB
             VirtioBlkBounceDiskHandle::File(file) => {
                 validate_bounce_file(&file)?;
                 disk_backend_resources::FileDiskHandle(file).into_resource()
+            }
+            #[cfg(target_os = "linux")]
+            VirtioBlkBounceDiskHandle::BlockDevice(file) => {
+                use std::os::unix::fs::FileTypeExt;
+                anyhow::ensure!(
+                    file.metadata()?.file_type().is_block_device(),
+                    "expected block device"
+                );
+                validate_bounce_flags(&file)?;
+                disk_backend_resources::BlockDeviceDiskHandle { file }.into_resource()
             }
             VirtioBlkBounceDiskHandle::Ram { len } => {
                 if len == 0 || len % 512 != 0 {
@@ -376,6 +392,20 @@ mod tests {
             let directory = std::fs::File::open(".").unwrap();
             assert!(validate_bounce_file(&directory).is_err());
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[async_test]
+    async fn bounce_block_device_rejects_regular_file(driver: DefaultDriver) {
+        let file = std::fs::File::open("Cargo.toml").unwrap();
+        let error = resolve_bounced_disk(
+            VirtioBlkBounceDiskHandle::BlockDevice(file).into_resource(),
+            driver,
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(format!("{error:#}").contains("expected block device"));
     }
 
     #[cfg(target_os = "linux")]
